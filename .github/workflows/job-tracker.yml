@@ -31,6 +31,7 @@ jobs:
         env:
           WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
           WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+          DEBUG: "true"
         run: python scraper.py
 
       - name: Commit cache update
