@@ -1,14 +1,17 @@
 """
-招聘信息抓取脚本 v5
-- tupu360：Playwright + 微信UA（放弃API）
-- Workday：Playwright 浏览器渲染（放弃API）
-- 罗氏：Playwright 浏览器渲染（已验证可用）
-- 推送：无链接依赖，信息驱动
+招聘信息抓取脚本 v6
+核心改动：
+- 绕过 webdriver 检测
+- wait_until domcontentloaded（替换 networkidle）
+- 模拟人类行为（鼠标移动/随机延迟）
+- tupu360 加 locale + timezone
+- 默沙东 timeout 延长
 """
 
 import json
 import os
 import time
+import random
 import hashlib
 import requests
 from datetime import datetime
@@ -27,7 +30,7 @@ MEDICAL_KEYWORDS = [
 ]
 TARGET_CITIES = ["北京", "上海", "beijing", "shanghai"]
 
-# ── tupu360 目标 ──────────────────────────────────────
+# ── 目标配置 ──────────────────────────────────────────
 TUPU_TARGETS = [
     {"name": "辉瑞-医学部",           "slug": "pfizer"},
     {"name": "赛诺菲-北京上海",       "slug": "sanofi"},
@@ -38,16 +41,15 @@ TUPU_TARGETS = [
     {"name": "百时美施贵宝-北京上海", "slug": "bms"},
 ]
 
-# ── Workday 目标 ──────────────────────────────────────
 WORKDAY_TARGETS = [
     {
         "name": "诺华-医学部",
-        "url": "https://novartis.wd3.myworkdayjobs.com/Novartis_Careers?q=medical&locationCountry=5dab0caf4c2a410c8e5f67e96e7e6a63",
+        "url": "https://novartis.wd3.myworkdayjobs.com/Novartis_Careers?q=medical",
         "search_url": "https://novartis.wd3.myworkdayjobs.com/Novartis_Careers?q=medical",
     },
     {
         "name": "拜耳-北京上海",
-        "url": "https://bayer.wd3.myworkdayjobs.com/Bayer?q=medical&locationCountry=a30a87ed25634629aa64ce4da97eff7b",
+        "url": "https://bayer.wd3.myworkdayjobs.com/Bayer?q=medical",
         "search_url": "https://bayer.wd3.myworkdayjobs.com/Bayer?q=medical",
     },
     {
@@ -57,7 +59,7 @@ WORKDAY_TARGETS = [
     },
     {
         "name": "艾伯维-北京上海",
-        "url": "https://abbvie.wd1.myworkdayjobs.com/abbvie_global?q=medical&locationCountry=a30a87ed25634629aa64ce4da97eff7b",
+        "url": "https://abbvie.wd1.myworkdayjobs.com/abbvie_global?q=medical",
         "search_url": "https://abbvie.wd1.myworkdayjobs.com/abbvie_global?q=medical",
     },
     {
@@ -67,7 +69,6 @@ WORKDAY_TARGETS = [
     },
 ]
 
-# ── 其他浏览器目标 ────────────────────────────────────
 BROWSER_TARGETS = [
     {
         "name": "罗氏-北京上海",
@@ -77,6 +78,7 @@ BROWSER_TARGETS = [
         "title_sel": "h3, h2, .job-title",
         "city_sel": ".location, .job-location, .city",
         "direct_link": True,
+        "wechat_ua": False,
     },
     {
         "name": "默沙东-北京上海",
@@ -86,6 +88,7 @@ BROWSER_TARGETS = [
         "title_sel": "h2, h3, .job-title, a",
         "city_sel": ".location, .city, .job-location",
         "direct_link": False,
+        "wechat_ua": False,
     },
 ]
 
@@ -113,22 +116,57 @@ def is_target_city(city):
     c = city.lower()
     return any(f.lower() in c for f in TARGET_CITIES)
 
+# 反检测 init script
+ANTI_DETECT_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3] });
+Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+window.chrome = { runtime: {} };
+"""
+
+def make_browser(p):
+    return p.chromium.launch(
+        headless=True,
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+        ]
+    )
+
 def make_wechat_context(browser):
-    return browser.new_context(
+    ctx = browser.new_context(
         user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.47",
         viewport={"width": 390, "height": 844},
+        locale="zh-CN",
+        timezone_id="Asia/Shanghai",
     )
+    ctx.add_init_script(ANTI_DETECT_SCRIPT)
+    return ctx
 
 def make_pc_context(browser):
-    return browser.new_context(
+    ctx = browser.new_context(
         user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
         viewport={"width": 1280, "height": 800},
+        locale="zh-CN",
+        timezone_id="Asia/Shanghai",
     )
+    ctx.add_init_script(ANTI_DETECT_SCRIPT)
+    return ctx
 
-def scroll_and_wait(page, times=3):
-    for _ in range(times):
+def human_behavior(page):
+    """模拟人类行为：随机鼠标移动 + 滚动"""
+    try:
+        page.mouse.move(random.randint(100, 400), random.randint(100, 300))
+        page.wait_for_timeout(random.randint(800, 1500))
+        page.evaluate("window.scrollTo(0, 300)")
+        page.wait_for_timeout(random.randint(500, 1000))
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        time.sleep(1.5)
+        page.wait_for_timeout(random.randint(800, 1500))
+        page.evaluate("window.scrollTo(0, 600)")
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
 
 # ── tupu360 抓取 ─────────────────────────────────────
 
@@ -139,17 +177,32 @@ def scrape_tupu360(target, browser):
     ctx  = make_wechat_context(browser)
     page = ctx.new_page()
     try:
-        page.goto(url, wait_until="networkidle", timeout=40000)
-        scroll_and_wait(page, 4)
+        page.goto(url, wait_until="domcontentloaded", timeout=40000)
+
+        # 等 JS 渲染
+        try:
+            page.wait_for_selector(
+                "[class*='job'], [class*='position'], a[href*='position']",
+                timeout=12000
+            )
+        except Exception:
+            pass
+
+        page.wait_for_timeout(3000)
+        human_behavior(page)
 
         if DEBUG:
             print(f"  [DEBUG] title: {page.title()}")
             print(f"  [DEBUG] url: {page.url}")
-            print(f"  [DEBUG] html: {page.content()[:500]}")
+            print(f"  [DEBUG] html: {page.content()[:800]}")
 
         items = []
-        for sel in ["a[href*='position']", ".position-item", ".job-item",
-                    ".job-card", "li.item", "[class*='position']"]:
+        for sel in [
+            "a[href*='position']",
+            "[class*='position-item']", "[class*='job-item']",
+            "[class*='position-card']", "[class*='job-card']",
+            "li[class*='item']",
+        ]:
             items = page.query_selector_all(sel)
             if items:
                 if DEBUG:
@@ -157,8 +210,12 @@ def scrape_tupu360(target, browser):
                 break
 
         for item in items:
-            title_el = item.query_selector(".position-name, .job-name, .name, h3, h2, span")
-            city_el  = item.query_selector(".position-city, .city, .location, .work-place")
+            title_el = item.query_selector(
+                "[class*='name'], [class*='title'], h3, h2, span"
+            )
+            city_el = item.query_selector(
+                "[class*='city'], [class*='location'], [class*='place']"
+            )
             title = title_el.inner_text().strip() if title_el else item.inner_text().strip()
             city  = city_el.inner_text().strip()  if city_el  else ""
             title = title.split("\n")[0].strip()
@@ -171,7 +228,7 @@ def scrape_tupu360(target, browser):
         ctx.close()
 
     if DEBUG:
-        print(f"  [DEBUG] raw: {jobs[:3]}")
+        print(f"  [DEBUG] raw: {jobs[:5]}")
 
     return [j for j in jobs if is_medical(j["title"]) and (not j["city"] or is_target_city(j["city"]))]
 
@@ -182,17 +239,32 @@ def scrape_workday_browser(target, browser):
     ctx  = make_pc_context(browser)
     page = ctx.new_page()
     try:
-        page.goto(target["url"], wait_until="networkidle", timeout=40000)
-        scroll_and_wait(page, 3)
+        page.goto(target["url"], wait_until="domcontentloaded", timeout=50000)
+
+        # 等 Workday JS 加载职位列表
+        try:
+            page.wait_for_selector(
+                "[data-automation-id='jobTitle'], li[class*='job'], a[href*='job']",
+                timeout=15000
+            )
+        except Exception:
+            pass
+
+        page.wait_for_timeout(3000)
+        human_behavior(page)
 
         if DEBUG:
             print(f"  [DEBUG] title: {page.title()}")
-            print(f"  [DEBUG] html: {page.content()[:500]}")
+            print(f"  [DEBUG] html: {page.content()[:800]}")
 
         items = []
-        for sel in ["li[class*='job']", "li[class*='Job']",
-                    "[data-automation-id='jobTitle']",
-                    ".job-listing-item", "article[class*='job']"]:
+        for sel in [
+            "li[data-automation-id='jobItem']",
+            "li[class*='css-'][class*='job']",
+            "[data-automation-id='jobTitle']",
+            "li[class*='job']",
+            "article[class*='job']",
+        ]:
             items = page.query_selector_all(sel)
             if items:
                 if DEBUG:
@@ -200,8 +272,12 @@ def scrape_workday_browser(target, browser):
                 break
 
         for item in items:
-            title_el = item.query_selector("[data-automation-id='jobTitle'], h3, h2, a")
-            city_el  = item.query_selector("[data-automation-id='locations'], .location, .city")
+            title_el = item.query_selector(
+                "[data-automation-id='jobTitle'], h3, h2, a"
+            )
+            city_el = item.query_selector(
+                "[data-automation-id='locations'], [class*='location'], [class*='city']"
+            )
             title = title_el.inner_text().strip() if title_el else ""
             city  = city_el.inner_text().strip()  if city_el  else ""
             if title:
@@ -213,7 +289,7 @@ def scrape_workday_browser(target, browser):
         ctx.close()
 
     if DEBUG:
-        print(f"  [DEBUG] raw: {jobs[:3]}")
+        print(f"  [DEBUG] raw: {jobs[:5]}")
 
     return [j for j in jobs if is_medical(j["title"]) and (not j["city"] or is_target_city(j["city"]))]
 
@@ -224,8 +300,15 @@ def scrape_browser(target, browser):
     ctx  = make_pc_context(browser)
     page = ctx.new_page()
     try:
-        page.goto(target["url"], wait_until="networkidle", timeout=40000)
-        scroll_and_wait(page, 3)
+        page.goto(target["url"], wait_until="domcontentloaded", timeout=60000)
+
+        try:
+            page.wait_for_selector(target["item_sel"], timeout=12000)
+        except Exception:
+            pass
+
+        page.wait_for_timeout(3000)
+        human_behavior(page)
 
         items = page.query_selector_all(target["item_sel"])
         if DEBUG:
@@ -278,7 +361,6 @@ def push_wxpusher(new_jobs):
             url        = job.get("url", "")
             source     = job.get("source", "browser")
             search_url = job.get("search_url", "")
-
             if url:
                 content += f"<li><a href='{url}'>{job['title']}</a>{city_str}</li>"
             elif search_url:
@@ -330,24 +412,24 @@ def main():
                 cache[key] = datetime.now().strftime("%Y-%m-%d")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = make_browser(p)
 
-        # 1. tupu360（微信UA）
+        # 1. tupu360（微信UA + 反检测）
         for target in TUPU_TARGETS:
             print(f"🔍 tupu360: {target['name']}")
             jobs = scrape_tupu360(target, browser)
             print(f"   → {len(jobs)} 条")
             search_url = f"https://careersite.tupu360.com/{target['slug']}/social-recruitment"
             process(target["name"], jobs, "tupu360", search_url)
-            time.sleep(2)
+            time.sleep(random.uniform(2, 4))
 
-        # 2. Workday（浏览器渲染）
+        # 2. Workday（PC UA + 反检测）
         for target in WORKDAY_TARGETS:
             print(f"🔍 Workday: {target['name']}")
             jobs = scrape_workday_browser(target, browser)
             print(f"   → {len(jobs)} 条")
             process(target["name"], jobs, "workday", target.get("search_url", ""))
-            time.sleep(2)
+            time.sleep(random.uniform(2, 4))
 
         # 3. 其他（罗氏、默沙东）
         for target in BROWSER_TARGETS:
@@ -355,7 +437,7 @@ def main():
             jobs = scrape_browser(target, browser)
             print(f"   → {len(jobs)} 条")
             process(target["name"], jobs, "browser", target.get("search_url", ""))
-            time.sleep(2)
+            time.sleep(random.uniform(2, 4))
 
         browser.close()
 
