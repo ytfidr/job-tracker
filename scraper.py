@@ -1,10 +1,9 @@
 """
-招聘信息抓取脚本 v4
-- tupu360 系列：使用 careersite.tupu360.com（PC端，无需微信）
-- Workday：诺华/拜耳/GSK/艾伯维/勃林格
-- 浏览器渲染：默克/默沙东/罗氏
-筛选：中国区 北京/上海 医学相关岗位
-推送：WxPusher
+招聘信息抓取脚本 v5
+- tupu360：Playwright + 微信UA（放弃API）
+- Workday：Playwright 浏览器渲染（放弃API）
+- 罗氏：Playwright 浏览器渲染（已验证可用）
+- 推送：无链接依赖，信息驱动
 """
 
 import json
@@ -19,82 +18,74 @@ from playwright.sync_api import sync_playwright
 WXPUSHER_APP_TOKEN = os.environ.get("WXPUSHER_APP_TOKEN", "")
 WXPUSHER_UID       = os.environ.get("WXPUSHER_UID", "")
 CACHE_FILE         = "cache/jobs.json"
+DEBUG              = os.environ.get("DEBUG", "false").lower() == "true"
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
-    "Accept": "application/json, text/html",
-}
+MEDICAL_KEYWORDS = [
+    "医学", "medical", "MSL", "临床", "clinical", "药物警戒",
+    "pharmacovigilance", "regulatory", "注册", "研发", "科学",
+    "药学", "affairs", "advisor", "scientist", "evidence",
+]
+TARGET_CITIES = ["北京", "上海", "beijing", "shanghai"]
 
-# 医学相关关键词过滤
-MEDICAL_KEYWORDS = ["医学", "medical", "MSL", "MA ", "药物警戒", "研发", "clinical", "临床", "科学", "药学", "注册"]
-
-# ── tupu360 PC端目标 ──────────────────────────────────
+# ── tupu360 目标 ──────────────────────────────────────
 TUPU_TARGETS = [
-    {"name": "辉瑞-医学部",       "slug": "pfizer",       "city": ["北京", "上海"], "keyword": "医学"},
-    {"name": "赛诺菲-北京上海",   "slug": "sanofi",       "city": ["北京", "上海"], "keyword": ""},
-    {"name": "AZ-医学部",         "slug": "az",           "city": ["北京", "上海"], "keyword": "医学"},
-    {"name": "礼来-医学研发",     "slug": "lilly",        "city": ["北京", "上海"], "keyword": "医学"},
-    {"name": "强生-医学",         "slug": "jnj",          "city": ["北京", "上海"], "keyword": "医学"},
-    {"name": "诺和诺德-北京上海", "slug": "novonordisk",  "city": ["北京", "上海"], "keyword": ""},
-    {"name": "百时美施贵宝-北京上海", "slug": "bms",      "city": ["北京", "上海"], "keyword": ""},
+    {"name": "辉瑞-医学部",           "slug": "pfizer"},
+    {"name": "赛诺菲-北京上海",       "slug": "sanofi"},
+    {"name": "AZ-医学部",             "slug": "az"},
+    {"name": "礼来-医学研发",         "slug": "lilly"},
+    {"name": "强生-医学",             "slug": "jnj"},
+    {"name": "诺和诺德-北京上海",     "slug": "novonordisk"},
+    {"name": "百时美施贵宝-北京上海", "slug": "bms"},
 ]
 
-# ── Workday API 目标 ──────────────────────────────────
+# ── Workday 目标 ──────────────────────────────────────
 WORKDAY_TARGETS = [
     {
-        "name": "诺华-北京上海",
-        "url": "https://novartis.wd3.myworkdayjobs.com/wday/cxs/novartis/Novartis_Careers/jobs",
-        "body": {"limit": 20, "offset": 0, "searchText": "medical affairs China", "facets": {}},
-        "city_filter": ["beijing", "shanghai", "北京", "上海"],
+        "name": "诺华-医学部",
+        "url": "https://novartis.wd3.myworkdayjobs.com/Novartis_Careers?q=medical&locationCountry=5dab0caf4c2a410c8e5f67e96e7e6a63",
+        "search_url": "https://novartis.wd3.myworkdayjobs.com/Novartis_Careers?q=medical",
     },
     {
         "name": "拜耳-北京上海",
-        "url": "https://bayer.wd3.myworkdayjobs.com/wday/cxs/bayer/Bayer/jobs",
-        "body": {"limit": 20, "offset": 0, "searchText": "medical China", "facets": {}},
-        "city_filter": ["beijing", "shanghai", "北京", "上海"],
+        "url": "https://bayer.wd3.myworkdayjobs.com/Bayer?q=medical&locationCountry=a30a87ed25634629aa64ce4da97eff7b",
+        "search_url": "https://bayer.wd3.myworkdayjobs.com/Bayer?q=medical",
     },
     {
         "name": "GSK-医学部",
-        "url": "https://gsk.wd5.myworkdayjobs.com/wday/cxs/gsk/GSK_External_Career_Site/jobs",
-        "body": {"limit": 20, "offset": 0, "searchText": "medical affairs China", "facets": {}},
-        "city_filter": ["beijing", "shanghai", "北京", "上海"],
+        "url": "https://gsk.wd5.myworkdayjobs.com/GSK_External_Career_Site?q=medical+affairs",
+        "search_url": "https://gsk.wd5.myworkdayjobs.com/GSK_External_Career_Site?q=medical+affairs",
     },
     {
         "name": "艾伯维-北京上海",
-        "url": "https://abbvie.wd1.myworkdayjobs.com/wday/cxs/abbvie/abbvie_global/jobs",
-        "body": {"limit": 20, "offset": 0, "searchText": "medical China", "facets": {}},
-        "city_filter": ["beijing", "shanghai", "北京", "上海"],
+        "url": "https://abbvie.wd1.myworkdayjobs.com/abbvie_global?q=medical&locationCountry=a30a87ed25634629aa64ce4da97eff7b",
+        "search_url": "https://abbvie.wd1.myworkdayjobs.com/abbvie_global?q=medical",
     },
     {
         "name": "勃林格殷格翰-北京上海",
-        "url": "https://boehringer-ingelheim.wd3.myworkdayjobs.com/wday/cxs/boehringer-ingelheim/Boehringer_Ingelheim_External_Career_Site/jobs",
-        "body": {"limit": 20, "offset": 0, "searchText": "medical China", "facets": {}},
-        "city_filter": ["beijing", "shanghai", "北京", "上海"],
+        "url": "https://boehringer-ingelheim.wd3.myworkdayjobs.com/Boehringer_Ingelheim_External_Career_Site?q=medical",
+        "search_url": "https://boehringer-ingelheim.wd3.myworkdayjobs.com/Boehringer_Ingelheim_External_Career_Site?q=medical",
     },
 ]
 
-# ── 浏览器渲染目标 ────────────────────────────────────
+# ── 其他浏览器目标 ────────────────────────────────────
 BROWSER_TARGETS = [
-    {
-        "name": "默沙东-北京上海",
-        "url": "https://jobs.merck.com/us/en/search-results?location=China&keywords=medical+affairs",
-        "item_sel": ".job-tile, article, li.job, .search-result-item, [class*='job-card']",
-        "title_sel": "h2, h3, .job-title, a",
-        "city_sel": ".location, .city, .job-location",
-    },
     {
         "name": "罗氏-北京上海",
         "url": "https://careers.roche.com/cn/zh/china-medical-affairs-and-access-jobs",
+        "search_url": "https://careers.roche.com/cn/zh/china-medical-affairs-and-access-jobs",
         "item_sel": ".job-listing-item, .jobs-list-item, article.job, .job-card, li.job",
         "title_sel": "h3, h2, .job-title",
         "city_sel": ".location, .job-location, .city",
+        "direct_link": True,
     },
     {
-        "name": "默克-北京上海",
-        "url": "https://jobs.emdgroup.com/jobs?facetcountry=cn&facetcity=beijing,shanghai",
-        "item_sel": ".job-tile, .job-item, article.job, [class*='job']",
-        "title_sel": "h3, h2, .job-title, a",
-        "city_sel": ".location, .city, [class*='location']",
+        "name": "默沙东-北京上海",
+        "url": "https://jobs.merck.com/us/en/search-results?location=China&keywords=medical",
+        "search_url": "https://jobs.merck.com/us/en/search-results?location=China&keywords=medical",
+        "item_sel": ".job-tile, article, li.job, .search-result-item, [class*='job-card']",
+        "title_sel": "h2, h3, .job-title, a",
+        "city_sel": ".location, .city, .job-location",
+        "direct_link": False,
     },
 ]
 
@@ -115,129 +106,152 @@ def save_cache(cache):
         json.dump(cache, f, ensure_ascii=False, indent=2)
 
 def is_medical(title):
-    if not MEDICAL_KEYWORDS:
-        return True
     t = title.lower()
     return any(kw.lower() in t for kw in MEDICAL_KEYWORDS)
 
-def is_target_city(city, city_filter):
-    if not city_filter:
-        return True
+def is_target_city(city):
     c = city.lower()
-    return any(f.lower() in c for f in city_filter)
+    return any(f.lower() in c for f in TARGET_CITIES)
 
-# ── tupu360 PC端 API ─────────────────────────────────
+def make_wechat_context(browser):
+    return browser.new_context(
+        user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.47",
+        viewport={"width": 390, "height": 844},
+    )
 
-def scrape_tupu360_pc(target):
+def make_pc_context(browser):
+    return browser.new_context(
+        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+        viewport={"width": 1280, "height": 800},
+    )
+
+def scroll_and_wait(page, times=3):
+    for _ in range(times):
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        time.sleep(1.5)
+
+# ── tupu360 抓取 ─────────────────────────────────────
+
+def scrape_tupu360(target, browser):
     jobs = []
     slug = target["slug"]
-    cities = target.get("city", [""])
-    keyword = target.get("keyword", "")
-
-    for city in (cities or [""]):
-        params = {
-            "recruitmentType": "SOCIALRECRUITMENT",
-            "pageNo": 1,
-            "pageSize": 50,
-            "currentLang": "zh_CN",
-        }
-        if city:
-            params["cityName"] = city
-        if keyword:
-            params["positionName"] = keyword
-
-        # 尝试两种常见 API 路径
-        for api_path in [
-            f"https://careersite.tupu360.com/{slug}/api/position/list",
-            f"https://{slug}.tupu360.com/api/position/search",
-        ]:
-            try:
-                r = requests.get(api_path, params=params, headers=HEADERS, timeout=15)
-                if r.status_code != 200:
-                    continue
-                data = r.json()
-                items = (
-                    data.get("data", {}).get("list")
-                    or data.get("data", {}).get("content")
-                    or data.get("list")
-                    or []
-                )
-                if not items:
-                    continue
-                for item in items:
-                    title = item.get("positionName") or item.get("name") or ""
-                    loc   = item.get("cityName") or item.get("workCity") or city
-                    pid   = item.get("positionId") or item.get("id") or ""
-                    link  = f"https://careersite.tupu360.com/{slug}/position/detail?positionId={pid}&recruitmentType=SOCIALRECRUITMENT" if pid else ""
-                    if title:
-                        jobs.append({"title": title, "city": loc, "url": link})
-                break  # 成功则不再尝试备用路径
-            except Exception as e:
-                print(f"  [tupu360 warn] {api_path}: {e}")
-                continue
-
-    # 去重
-    seen, unique = set(), []
-    for j in jobs:
-        k = j["title"] + j["city"]
-        if k not in seen:
-            seen.add(k)
-            unique.append(j)
-    return unique
-
-# ── Workday API ──────────────────────────────────────
-
-def scrape_workday(target):
-    jobs = []
+    url  = f"https://careersite.tupu360.com/{slug}/social-recruitment"
+    ctx  = make_wechat_context(browser)
+    page = ctx.new_page()
     try:
-        r = requests.post(
-            target["url"],
-            json=target["body"],
-            headers={**HEADERS, "Content-Type": "application/json"},
-            timeout=15,
-        )
-        r.raise_for_status()
-        data = r.json()
-        items = data.get("jobPostings") or data.get("jobs") or []
-        city_filter = target.get("city_filter", [])
+        page.goto(url, wait_until="networkidle", timeout=40000)
+        scroll_and_wait(page, 4)
+
+        if DEBUG:
+            print(f"  [DEBUG] title: {page.title()}")
+            print(f"  [DEBUG] url: {page.url}")
+            print(f"  [DEBUG] html: {page.content()[:500]}")
+
+        items = []
+        for sel in ["a[href*='position']", ".position-item", ".job-item",
+                    ".job-card", "li.item", "[class*='position']"]:
+            items = page.query_selector_all(sel)
+            if items:
+                if DEBUG:
+                    print(f"  [DEBUG] selector '{sel}' → {len(items)} 个")
+                break
+
         for item in items:
-            title = item.get("title") or item.get("name") or ""
-            city  = item.get("locationsText") or item.get("location") or ""
-            ext   = item.get("externalPath") or ""
-            base  = target["url"].split("/wday/")[0]
-            link  = base + ext if ext.startswith("/") else ext
-            if title and is_target_city(city, city_filter) and is_medical(title):
-                jobs.append({"title": title, "city": city, "url": link})
+            title_el = item.query_selector(".position-name, .job-name, .name, h3, h2, span")
+            city_el  = item.query_selector(".position-city, .city, .location, .work-place")
+            title = title_el.inner_text().strip() if title_el else item.inner_text().strip()
+            city  = city_el.inner_text().strip()  if city_el  else ""
+            title = title.split("\n")[0].strip()
+            if title and len(title) > 2:
+                jobs.append({"title": title, "city": city})
+
     except Exception as e:
-        print(f"  [workday error] {target['name']}: {e}")
-    return jobs
+        print(f"  [tupu360 error] {target['name']}: {e}")
+    finally:
+        ctx.close()
 
-# ── 浏览器渲染 ───────────────────────────────────────
+    if DEBUG:
+        print(f"  [DEBUG] raw: {jobs[:3]}")
 
-def scrape_browser(target, page):
+    return [j for j in jobs if is_medical(j["title"]) and (not j["city"] or is_target_city(j["city"]))]
+
+# ── Workday 浏览器抓取 ───────────────────────────────
+
+def scrape_workday_browser(target, browser):
     jobs = []
+    ctx  = make_pc_context(browser)
+    page = ctx.new_page()
     try:
         page.goto(target["url"], wait_until="networkidle", timeout=40000)
-        for _ in range(3):
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            time.sleep(1.5)
+        scroll_and_wait(page, 3)
+
+        if DEBUG:
+            print(f"  [DEBUG] title: {page.title()}")
+            print(f"  [DEBUG] html: {page.content()[:500]}")
+
+        items = []
+        for sel in ["li[class*='job']", "li[class*='Job']",
+                    "[data-automation-id='jobTitle']",
+                    ".job-listing-item", "article[class*='job']"]:
+            items = page.query_selector_all(sel)
+            if items:
+                if DEBUG:
+                    print(f"  [DEBUG] selector '{sel}' → {len(items)} 个")
+                break
+
+        for item in items:
+            title_el = item.query_selector("[data-automation-id='jobTitle'], h3, h2, a")
+            city_el  = item.query_selector("[data-automation-id='locations'], .location, .city")
+            title = title_el.inner_text().strip() if title_el else ""
+            city  = city_el.inner_text().strip()  if city_el  else ""
+            if title:
+                jobs.append({"title": title, "city": city})
+
+    except Exception as e:
+        print(f"  [workday error] {target['name']}: {e}")
+    finally:
+        ctx.close()
+
+    if DEBUG:
+        print(f"  [DEBUG] raw: {jobs[:3]}")
+
+    return [j for j in jobs if is_medical(j["title"]) and (not j["city"] or is_target_city(j["city"]))]
+
+# ── 其他浏览器目标 ───────────────────────────────────
+
+def scrape_browser(target, browser):
+    jobs = []
+    ctx  = make_pc_context(browser)
+    page = ctx.new_page()
+    try:
+        page.goto(target["url"], wait_until="networkidle", timeout=40000)
+        scroll_and_wait(page, 3)
+
         items = page.query_selector_all(target["item_sel"])
-        print(f"   → DOM 找到 {len(items)} 个元素")
+        if DEBUG:
+            print(f"  [DEBUG] selector → {len(items)} 个")
+
         for item in items:
             title_el = item.query_selector(target["title_sel"])
             city_el  = item.query_selector(target["city_sel"])
-            link_el  = item.query_selector("a")
+            link_el  = item.query_selector("a") if target.get("direct_link") else None
             title = title_el.inner_text().strip() if title_el else ""
             city  = city_el.inner_text().strip()  if city_el  else ""
-            href  = link_el.get_attribute("href") if link_el  else ""
-            if href and href.startswith("/"):
-                from urllib.parse import urlparse
-                p = urlparse(target["url"])
-                href = f"{p.scheme}://{p.netloc}{href}"
+            href  = ""
+            if link_el:
+                href = link_el.get_attribute("href") or ""
+                if href.startswith("/"):
+                    from urllib.parse import urlparse
+                    p = urlparse(target["url"])
+                    href = f"{p.scheme}://{p.netloc}{href}"
             if title and len(title) > 1:
-                jobs.append({"title": title, "city": city, "url": href or target["url"]})
+                jobs.append({"title": title, "city": city, "url": href})
+
     except Exception as e:
         print(f"  [browser error] {target['name']}: {e}")
+    finally:
+        ctx.close()
+
     return jobs
 
 # ── WxPusher 推送 ────────────────────────────────────
@@ -256,11 +270,26 @@ def push_wxpusher(new_jobs):
 
     content = f"<h3>💊 新招聘信息 · {len(new_jobs)} 条</h3>"
     content += f"<p style='color:#888;font-size:12px'>{datetime.now().strftime('%Y-%m-%d %H:%M')}</p><hr>"
+
     for company, jobs in groups.items():
         content += f"<h4>🏢 {company}</h4><ul>"
         for job in jobs:
-            city_tag = f" <span style='color:#888;font-size:12px'>({job['city']})</span>" if job.get("city") else ""
-            content += f"<li><a href='{job['url']}'>{job['title']}</a>{city_tag}</li>"
+            city_str   = f"（{job['city']}）" if job.get("city") else ""
+            url        = job.get("url", "")
+            source     = job.get("source", "browser")
+            search_url = job.get("search_url", "")
+
+            if url:
+                content += f"<li><a href='{url}'>{job['title']}</a>{city_str}</li>"
+            elif search_url:
+                tag = "📱 微信渠道" if source == "tupu360" else "🔎 官网搜索"
+                content += (
+                    f"<li>{job['title']}{city_str}<br>"
+                    f"<span style='color:#888;font-size:12px'>{tag}｜"
+                    f"<a href='{search_url}'>前往查看</a></span></li>"
+                )
+            else:
+                content += f"<li>{job['title']}{city_str}</li>"
         content += "</ul>"
 
     payload = {
@@ -283,46 +312,51 @@ def push_wxpusher(new_jobs):
 # ── 主流程 ───────────────────────────────────────────
 
 def main():
-    cache = load_cache()
+    cache    = load_cache()
     new_jobs = []
 
-    def process(company_name, jobs):
+    def process(company_name, jobs, source, search_url=""):
         for job in jobs:
             key = job_key(company_name, job["title"], job.get("city", ""))
             if key not in cache:
-                new_jobs.append({"company": company_name, **job})
+                new_jobs.append({
+                    "company":    company_name,
+                    "title":      job["title"],
+                    "city":       job.get("city", ""),
+                    "url":        job.get("url", ""),
+                    "source":     source,
+                    "search_url": search_url,
+                })
                 cache[key] = datetime.now().strftime("%Y-%m-%d")
 
-    # 1. tupu360 PC端
-    for target in TUPU_TARGETS:
-        print(f"🔍 tupu360: {target['name']}")
-        jobs = scrape_tupu360_pc(target)
-        print(f"   → {len(jobs)} 条")
-        process(target["name"], jobs)
-        time.sleep(1)
-
-    # 2. Workday API
-    for target in WORKDAY_TARGETS:
-        print(f"🔍 Workday: {target['name']}")
-        jobs = scrape_workday(target)
-        print(f"   → {len(jobs)} 条")
-        process(target["name"], jobs)
-        time.sleep(1)
-
-    # 3. 浏览器渲染
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        ctx = browser.new_context(
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800},
-        )
-        page = ctx.new_page()
+
+        # 1. tupu360（微信UA）
+        for target in TUPU_TARGETS:
+            print(f"🔍 tupu360: {target['name']}")
+            jobs = scrape_tupu360(target, browser)
+            print(f"   → {len(jobs)} 条")
+            search_url = f"https://careersite.tupu360.com/{target['slug']}/social-recruitment"
+            process(target["name"], jobs, "tupu360", search_url)
+            time.sleep(2)
+
+        # 2. Workday（浏览器渲染）
+        for target in WORKDAY_TARGETS:
+            print(f"🔍 Workday: {target['name']}")
+            jobs = scrape_workday_browser(target, browser)
+            print(f"   → {len(jobs)} 条")
+            process(target["name"], jobs, "workday", target.get("search_url", ""))
+            time.sleep(2)
+
+        # 3. 其他（罗氏、默沙东）
         for target in BROWSER_TARGETS:
             print(f"🔍 浏览器: {target['name']}")
-            jobs = scrape_browser(target, page)
+            jobs = scrape_browser(target, browser)
             print(f"   → {len(jobs)} 条")
-            process(target["name"], jobs)
+            process(target["name"], jobs, "browser", target.get("search_url", ""))
             time.sleep(2)
+
         browser.close()
 
     print(f"\n📊 共发现 {len(new_jobs)} 条新职位")
